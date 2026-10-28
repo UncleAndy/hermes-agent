@@ -1,0 +1,32 @@
+
+name: Import upstream tags
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  import-tags:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy all upstream tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          UPSTREAM=$(gh api "repos/$GITHUB_REPOSITORY" \
+            --jq '.parent.full_name')
+
+          if [ -z "$UPSTREAM" ] || [ "$UPSTREAM" = "null" ]; then
+            echo "Parent repository not found"
+            exit 1
+          fi
+
+          git fetch "https://github.com/$UPSTREAM.git" \
+            '+refs/tags/*:refs/tags/*'
+
+          git push origin --tags
