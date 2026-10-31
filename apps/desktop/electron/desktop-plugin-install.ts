@@ -13,8 +13,10 @@ import path from 'node:path'
 import { parse as parseYaml } from 'yaml'
 
 import {
+  desktopHalfSource,
   PACKAGE_MARKER,
   publishDesktopTree,
+  rootLayoutFilter,
   withDesktopPluginsRoot,
   writeDesktopHalfMarker
 } from './desktop-plugins-root'
@@ -43,6 +45,8 @@ export interface PluginProbeResult {
   desktopName?: string | null
   warnings: string[]
   insecure: boolean
+  /** The commit that was read; an install of this source is held to it. */
+  sha?: string
   error?: string
 }
 
@@ -51,7 +55,12 @@ export interface DesktopPluginInstallResult {
   pluginName?: string
   path?: string
   error?: string
+  /** Refused: the reviewed commit is no longer in the source. The dialog reads the source again. */
+  sourceMoved?: boolean
 }
+
+/** `checkoutReviewedCommit`'s refusal, told apart by class rather than by its message. */
+class ReviewedCommitUnavailable extends Error {}
 
 export function resolvePluginGitUrl(identifier: string): ResolvedGitUrl {
   const trimmed = identifier.trim()
@@ -185,20 +194,16 @@ async function pathIsFile(filePath: string): Promise<boolean> {
   }
 }
 
+/** The desktop entry by the one rule the reconcile applies to an installed package too
+ *  (`desktopHalfSource`): a root `plugin.js` wins over `desktop/plugin.js`. */
 export function findDesktopEntry(pluginRoot: string): { entryFile: string; sourceSubdir: string } | null {
-  const rootPlugin = path.join(pluginRoot, 'plugin.js')
+  const sourceDir = desktopHalfSource(pluginRoot)
 
-  if (pathExistsSync(rootPlugin)) {
-    return { entryFile: rootPlugin, sourceSubdir: '.' }
+  if (!sourceDir) {
+    return null
   }
 
-  const nestedPlugin = path.join(pluginRoot, 'desktop', 'plugin.js')
-
-  if (pathExistsSync(nestedPlugin)) {
-    return { entryFile: nestedPlugin, sourceSubdir: 'desktop' }
-  }
-
-  return null
+  return { entryFile: path.join(sourceDir, 'plugin.js'), sourceSubdir: path.relative(pluginRoot, sourceDir) || '.' }
 }
 
 /** Files beside a `plugin.yaml` that the agent side loads: a `register(ctx)` package, or a dashboard
@@ -374,6 +379,49 @@ async function cloneToTemp(gitBin: string, gitUrl: string, subdir: string | null
   }
 }
 
+const COMMIT_SHA = /^[0-9a-f]{40}$/
+
+async function headSha(gitBin: string, cloneRoot: string, revision = 'HEAD'): Promise<string> {
+  const { code, stdout, stderr } = await execGit(gitBin, ['rev-parse', revision], {
+    cwd: cloneRoot,
+    env: noninteractiveGitEnv(),
+    timeoutMs: GIT_TIMEOUT_MS
+  })
+
+  if (code !== 0) {
+    throw new Error(`Git rev-parse failed:\n${stderr.trim()}`)
+  }
+
+  return stdout.trim().toLowerCase()
+}
+
+/** Detach the clone at `sha`, the commit the install dialog showed: a branch that moved after review must
+ *  not put down a tree nobody inspected. A source that no longer has it is refused. */
+async function checkoutReviewedCommit(gitBin: string, cloneRoot: string, sha: string): Promise<void> {
+  const reviewed = sha.trim().toLowerCase()
+
+  if (!COMMIT_SHA.test(reviewed)) {
+    throw new Error('Installing a desktop plugin needs the full commit the install dialog reviewed.')
+  }
+
+  try {
+    if ((await headSha(gitBin, cloneRoot)) !== reviewed) {
+      await runGitOrThrow(gitBin, ['fetch', '--depth', '1', 'origin', reviewed], cloneRoot)
+      await runGitOrThrow(gitBin, ['checkout', '--detach', reviewed], cloneRoot)
+    }
+
+    // A catalog pin may name an annotated tag: HEAD is the commit it peels to.
+    if ((await headSha(gitBin, cloneRoot)) !== (await headSha(gitBin, cloneRoot, `${reviewed}^{commit}`))) {
+      throw new Error(`HEAD is not ${reviewed}.`)
+    }
+  } catch (err) {
+    throw new ReviewedCommitUnavailable(
+      `The commit you reviewed (${reviewed.slice(0, 12)}) could not be checked out; the source may have changed ` +
+        `since you reviewed it. Re-open the install dialog to review it again. ${err instanceof Error ? err.message : String(err)}`
+    )
+  }
+}
+
 async function resolvePluginRoot(cloneRoot: string, subdir: string | null): Promise<string> {
   if (!subdir) {
     return cloneRoot
@@ -428,7 +476,8 @@ export async function probePluginRepo(gitBin: string, identifier: string): Promi
         agentName: detected.agentName ?? (detected.agent ? repoFallback : null),
         desktopName: detected.desktop ? desktopPluginFolderName(gitUrl, subdir) : null,
         warnings,
-        insecure
+        insecure,
+        sha: await headSha(gitBin, cloneRoot)
       }
     } finally {
       await fsp.rm(cloneRoot, { recursive: true, force: true }).catch(() => undefined)
@@ -449,13 +498,20 @@ export async function installDesktopPluginFromGit(
   gitBin: string,
   identifier: string,
   desktopPluginsRoot: string,
-  force = false
+  force = false,
+  /** The commit the install dialog reviewed (`probePluginRepo`'s `sha`): the half is installed from
+   *  exactly that tree or refused. */
+  sha?: string
 ): Promise<DesktopPluginInstallResult> {
   try {
     const { gitUrl, subdir } = resolvePluginGitUrl(identifier)
     const cloneRoot = await cloneToTemp(gitBin, gitUrl, subdir)
 
     try {
+      if (sha !== undefined) {
+        await checkoutReviewedCommit(gitBin, cloneRoot, sha)
+      }
+
       const pluginRoot = await resolvePluginRoot(cloneRoot, subdir)
       const detected = await detectPluginComponents(pluginRoot)
 
@@ -479,15 +535,13 @@ export async function installDesktopPluginFromGit(
       // Under the root's writer lock: the exists check and the publish must not
       // interleave with a reconcile pass copying the same package folder.
       return await withDesktopPluginsRoot<DesktopPluginInstallResult>(desktopPluginsRoot, async () => {
-        if ((await pathIsDirectory(targetDir)) || (await pathIsFile(targetPlugin))) {
-          if (!force) {
-            return {
-              ok: false,
-              error: `Desktop plugin '${pluginName}' already exists. Enable force reinstall to replace it.`
-            }
+        // Force replaces the folder only once the new tree has passed its checks and been staged
+        // (publishDesktopTree): a refused reinstall keeps the working copy.
+        if (!force && ((await pathIsDirectory(targetDir)) || (await pathIsFile(targetPlugin)))) {
+          return {
+            ok: false,
+            error: `Desktop plugin '${pluginName}' already exists. Enable force reinstall to replace it.`
           }
-
-          await fsp.rm(targetDir, { recursive: true, force: true })
         }
 
         // Staged copy + rename: a failed copy must not leave an empty `targetDir`
@@ -496,30 +550,35 @@ export async function installDesktopPluginFromGit(
         // part of that publication — without it the Plugins page cannot tell this
         // copy belongs to the agent row (it sits on "copying…" forever) and the
         // half loads default-enabled instead of opt-in.
-        await publishDesktopTree(sourceDir, targetDir, async staged => {
-          if (!packageName) {
-            // A desktop-only repo is a standalone plugin. A package marker it
-            // ships would name another package's agent half as its own (pairing
-            // it on the Plugins page and letting it render that package's tool
-            // media), so only this installer or the reconcile pass writes one.
-            await fsp.rm(path.join(staged, PACKAGE_MARKER), { force: true })
+        await publishDesktopTree(
+          { dir: sourceDir, plainWithin: cloneRoot },
+          targetDir,
+          async staged => {
+            if (!packageName) {
+              // A desktop-only repo is a standalone plugin. A package marker it
+              // ships would name another package's agent half as its own (pairing
+              // it on the Plugins page and letting it render that package's tool
+              // media), so only this installer or the reconcile pass writes one.
+              await fsp.rm(path.join(staged, PACKAGE_MARKER), { force: true })
 
-            return
-          }
+              return
+            }
 
-          await writeDesktopHalfMarker(staged, {
-            package: packageName,
-            repo: gitUrl,
-            // The published folder, not the temp clone. The clone is deleted
-            // below; a source that disappears is ghost-pruned on the next
-            // reconcile when no local `plugins/<name>/desktop` exists to
-            // re-copy from (remote backend, or Desktop UI only). A later pass
-            // that does find the agent package still replaces this copy,
-            // because this path is not that package's `desktop/` dir.
-            source: targetDir,
-            sourceMtimeMs: (await fsp.stat(path.join(staged, 'plugin.js'))).mtimeMs
-          })
-        })
+            await writeDesktopHalfMarker(staged, {
+              package: packageName,
+              repo: gitUrl,
+              // The published folder, not the temp clone. The clone is deleted
+              // below; a source that disappears is ghost-pruned on the next
+              // reconcile when no local `plugins/<name>/desktop` exists to
+              // re-copy from (remote backend, or Desktop UI only). A later pass
+              // that does find the agent package still replaces this copy,
+              // because this path is not that package's `desktop/` dir.
+              source: targetDir,
+              sourceMtimeMs: (await fsp.stat(path.join(staged, 'plugin.js'))).mtimeMs
+            })
+          },
+          detected.desktopSourceSubdir === '.' ? rootLayoutFilter : undefined
+        )
 
         if (!(await pathIsFile(targetPlugin))) {
           return { ok: false, error: `Install completed but ${targetPlugin} is missing.` }
@@ -531,7 +590,11 @@ export async function installDesktopPluginFromGit(
       await fsp.rm(cloneRoot, { recursive: true, force: true }).catch(() => undefined)
     }
   } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      ...(err instanceof ReviewedCommitUnavailable ? { sourceMoved: true } : {})
+    }
   }
 }
 
