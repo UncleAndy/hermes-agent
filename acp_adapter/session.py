@@ -232,7 +232,10 @@ class SessionManager:
         # Then persisted sessions not currently in memory.
         for sid, row in persisted_rows.items():
             message_count = int(row.get("message_count") or 0)
-            session_cwd = _parse_model_config(row.get("model_config")).get("cwd", ".")
+            # The owner writes the row's cwd into the ``cwd`` column; ``model_config`` carries it only
+            # when the editor wrote the row itself. Reading the column first keeps a gateway-owned
+            # editor thread in the list — ``catalog.catalog_sessions`` reads it the same way.
+            session_cwd = row.get("cwd") or _parse_model_config(row.get("model_config")).get("cwd", ".")
             if sid in seen_ids or message_count <= 0 or not _matches(session_cwd):
                 continue
             results.append(_session_info(
@@ -454,7 +457,9 @@ class SessionManager:
         except Exception:
             logger.debug("Failed to query DB for ACP session %s", session_id, exc_info=True)
             return None
-        if row is None or row.get("source") != "acp":
+        # The gateway owner stores an editor thread as ``local`` with ``created_source='acp'``; the
+        # label alone would leave every panel conversation unreachable after a restart.
+        if row is None or "acp" not in {row.get("source"), row.get("created_source")}:
             return None
 
         # A previous adapter process stamped the row ended at its stdio
@@ -467,7 +472,7 @@ class SessionManager:
                 logger.debug("Failed to reopen ACP session %s", session_id, exc_info=True)
 
         meta = _parse_model_config(row.get("model_config"))
-        cwd, model = meta.get("cwd", "."), row.get("model") or None
+        cwd, model = (row.get("cwd") or meta.get("cwd", ".")), row.get("model") or None
 
         # repair_alternation: this list becomes the resumed agent's LIVE conversation; a durable
         # ``user;user`` violation in state.db would otherwise re-fire the pre-request repair every request.
