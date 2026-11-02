@@ -32,6 +32,11 @@ def served_model_from_headers(headers: Any) -> Optional[str]:
     return None
 
 
+# Diagnostic, once per process: what the credits hook actually saw. A balance that never reaches a
+# client is otherwise invisible - the hook swallows its own misses on purpose.
+_credits_capture_reported = False
+
+
 def install_served_model_capture(agent: Any, client: Any) -> None:
     """Register the response hook on *client*'s ``httpx`` transport (idempotent per client)."""
     http_client = getattr(client, "_client", None)
@@ -50,14 +55,27 @@ def install_served_model_capture(agent: Any, client: Any) -> None:
                 # and every money surface reads it from the credits state. Captured here, on the one
                 # hook every primary client passes through, so no call path has to remember to: a
                 # non-streaming turn, a stream, a recovery - the balance lands either way.
+                global _credits_capture_reported
+
                 try:
                     from agent.credits_tracker import parse_credits_headers
 
+                    names = [str(k) for k in (headers or {}) if str(k).lower().startswith("x-nous-credits")]
                     state = parse_credits_headers(headers, provider=str(getattr(agent, "provider", "") or ""))
                     if state is not None:
                         agent._credits_state = state
+                    if not _credits_capture_reported:
+                        _credits_capture_reported = True
+                        if state is not None:
+                            logger.warning("credits ▸ capture ok: purchased_usd=%s (%d nous headers)",
+                                           state.purchased_usd, len(names))
+                        elif names:
+                            logger.warning("credits ▸ %d nous headers on the response, none parsed: %s",
+                                           len(names), names[:4])
+                        else:
+                            logger.warning("credits ▸ a response arrived with no x-nous-credits-* headers")
                 except Exception:
-                    logger.debug("credits header capture skipped", exc_info=True)
+                    logger.warning("credits ▸ header capture raised", exc_info=True)
         except Exception:
             logger.debug("served-model header capture skipped", exc_info=True)
 

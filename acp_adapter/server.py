@@ -103,6 +103,8 @@ def _history_summary_meta(message: dict[str, Any], text: str) -> dict[str, Any] 
 # waits for it: the first turn a panel sees asks, and the figure is there for the next one.
 _nous_account_cache: Optional[dict[str, Any]] = None
 _nous_account_lock = threading.Lock()
+# Diagnostic, once per process: said when a turn had no account to send.
+_account_usage_reported = False
 _NOUS_ACCOUNT_TTL_S = 60.0
 
 
@@ -186,6 +188,14 @@ def _account_usage_meta(agent: Any) -> dict[str, Any] | None:
     stale = False
     state = getattr(agent, "_credits_state", None)
     source = "the last response's own accounting"
+    if state is None:
+        global _account_usage_reported
+        if not _account_usage_reported:
+            _account_usage_reported = True
+            logger.warning(
+                "account usage ▸ the agent has no credits state (provider=%s, client=%s)",
+                provider, hasattr(agent, "client"),
+            )
     snapshot = _snapshot_from_credits_state(state)
     if snapshot is not None:
         lines = _account_lines(snapshot, render_account_usage_lines)
