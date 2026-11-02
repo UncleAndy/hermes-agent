@@ -98,6 +98,60 @@ def _history_summary_meta(message: dict[str, Any], text: str) -> dict[str, Any] 
     return None
 
 
+
+def _account_usage_meta(agent: Any) -> dict[str, Any] | None:
+    """What the account says, in the provider's own words, for ``_meta.hermes.accountUsage``.
+
+    The lines, and not fields, because that is the shape every money surface already shares: ``/usage``
+    prints a list of labelled facts and the gateway carries ``credits_lines``. What a provider reports
+    differs from provider to provider - a Nous top-up, a Codex window, another provider's balance - while
+    a list of labelled lines does not, so a client shows whatever the provider said without knowing the
+    provider at all.
+
+    No waiting and no credential: a provider whose response carries its own accounting is read from that
+    (already in memory), and any other provider's last known block comes from the account cache every
+    surface keeps, with a stale one refreshed in the background for a later turn instead of the turn
+    waiting for it. Nothing is not zero: an account that could not be read says nothing here.
+    """
+    try:
+        from agent.account_usage import _snapshot_from_credits_state, render_account_usage_lines
+    except Exception:
+        logger.debug("account usage ▸ imports unavailable", exc_info=True)
+        return None
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    stale = False
+    snapshot = _snapshot_from_credits_state(getattr(agent, "_credits_state", None))
+    if snapshot is None:
+        if not provider:
+            return None
+        try:
+            from agent.account_usage_cache import (
+                cached_account_usage,
+                refresh_account_usage_async,
+                snapshot_is_stale,
+            )
+        except Exception:
+            logger.debug("account usage ▸ cache unavailable", exc_info=True)
+            return None
+        snapshot = cached_account_usage(provider)
+        if snapshot is None:
+            refresh_account_usage_async([provider])
+            return None
+        stale = snapshot_is_stale(snapshot)
+        if stale:
+            refresh_account_usage_async([provider])
+    # `_snapshot_from_credits_state` is written for the dev fixture and says so in a tail line; a live
+    # account is not a fixture, and a balance that arrives with a lie beside it is worse than none. Every
+    # other line is the account's own, exactly as `/usage` prints it.
+    lines = [
+        str(line)
+        for line in render_account_usage_lines(snapshot)
+        if str(line).strip() and "HERMES_DEV_CREDITS_FIXTURE" not in str(line)
+    ]
+    if not lines:
+        return None
+    return {"provider": provider or None, "lines": lines, "stale": stale}
+
 # role -> (chunk class, session_update tag) for history replay.
 _HISTORY_CHUNK_TYPES = {
     "user": (UserMessageChunk, "user_message_chunk"), "assistant": (AgentMessageChunk, "agent_message_chunk")
@@ -363,7 +417,12 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     @staticmethod
     def _build_usage_update(state: SessionState) -> UsageUpdate | None:
         """``usage_update`` for Zed's context indicator: ``size`` = context window, ``used`` =
-        estimated request pressure (system prompt + history + tool schemas)."""
+        estimated request pressure (system prompt + history + tool schemas).
+
+        The account rides with it (``_meta.hermes.accountUsage``): ACP has no field for money - the
+        update's own ``cost`` is the session's spend, not the balance - and ``_meta`` is what the
+        protocol reserves for a surface's own facts. Sending it here costs nothing: the update is
+        built at the same moment, from an agent that has just answered."""
         compressor = getattr(state.agent, "context_compressor", None)
         size = int(getattr(compressor, "context_length", 0) or 0)
         if size <= 0:
@@ -373,7 +432,11 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         except Exception:
             logger.debug("Could not estimate ACP native context usage", exc_info=True)
             used = int(getattr(compressor, "last_prompt_tokens", 0) or 0)
-        return UsageUpdate(session_update="usage_update", size=max(size, 0), used=max(used, 0))
+        account = _account_usage_meta(state.agent)
+        return UsageUpdate(
+            session_update="usage_update", size=max(size, 0), used=max(used, 0),
+            field_meta={"hermes": {"accountUsage": account}} if account else None,
+        )
 
     async def _send_usage_update(self, state: SessionState) -> None:
         if self._conn and (update := self._build_usage_update(state)) is not None:
