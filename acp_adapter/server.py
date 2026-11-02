@@ -99,6 +99,64 @@ def _history_summary_meta(message: dict[str, Any], text: str) -> dict[str, Any] 
 
 
 
+# The Nous account block, remembered between turns. The portal answers at most once a minute, and no turn
+# waits for it: the first turn a panel sees asks, and the figure is there for the next one.
+_nous_account_cache: Optional[dict[str, Any]] = None
+_nous_account_lock = threading.Lock()
+_NOUS_ACCOUNT_TTL_S = 60.0
+
+
+def _remember_nous_account(lines: list[str]) -> None:
+    global _nous_account_cache
+
+    with _nous_account_lock:
+        _nous_account_cache = {"lines": lines, "at": time.monotonic()}
+
+
+def _remembered_nous_account() -> Optional[list[str]]:
+    with _nous_account_lock:
+        remembered = _nous_account_cache
+    if remembered is None or (time.monotonic() - remembered["at"]) >= _NOUS_ACCOUNT_TTL_S:
+        return None
+    return list(remembered["lines"])
+
+
+def _warm_nous_account_cache() -> None:
+    """Fetches the Nous block off the turn's path: a later turn finds it remembered.
+
+    The same call the CLI and the pickers make, on a thread of its own - a status line must not hold a
+    turn up, and the figure is happy to arrive one turn later. A failure is a log line, never an
+    exception in a turn.
+    """
+    def work() -> None:
+        try:
+            from agent.account_usage import build_nous_credits_snapshot, render_account_usage_lines
+            from hermes_cli.nous_account import get_nous_portal_account_info
+
+            account = get_nous_portal_account_info()
+            snapshot = build_nous_credits_snapshot(account) if account is not None else None
+            lines = _account_lines(snapshot, render_account_usage_lines) if snapshot is not None else []
+            if lines:
+                _remember_nous_account(lines)
+        except Exception:
+            logger.debug("account usage ▸ portal warm failed", exc_info=True)
+
+    try:
+        threading.Thread(target=work, name="hermes-acp-account-warm", daemon=True).start()
+    except Exception:
+        logger.debug("account usage ▸ portal warm could not start", exc_info=True)
+
+
+def _account_lines(snapshot: Any, render: Any) -> list[str]:
+    """The account's own lines, without the dev fixture's tail: a live account is not a fixture, and a
+    balance that arrives with a lie beside it is worse than no balance at all."""
+    return [
+        str(line)
+        for line in render(snapshot)
+        if str(line).strip() and "HERMES_DEV_CREDITS_FIXTURE" not in str(line)
+    ]
+
+
 def _account_usage_meta(agent: Any) -> dict[str, Any] | None:
     """What the account says, in the provider's own words, for ``_meta.hermes.accountUsage``.
 
@@ -108,22 +166,37 @@ def _account_usage_meta(agent: Any) -> dict[str, Any] | None:
     a list of labelled lines does not, so a client shows whatever the provider said without knowing the
     provider at all.
 
-    No waiting and no credential: a provider whose response carries its own accounting is read from that
-    (already in memory), and any other provider's last known block comes from the account cache every
-    surface keeps, with a stale one refreshed in the background for a later turn instead of the turn
-    waiting for it. Nothing is not zero: an account that could not be read says nothing here.
+    Nothing waits on the network and nothing reads a credential: a provider that accounts for itself in
+    its response (Nous sends ``x-nous-credits-*``) is read from what is already in memory; a Nous account
+    whose headers have not been seen is read from this adapter's own remembered block, filled on a thread
+    the first time; any other provider's last known block comes from the account cache every surface
+    shares, a stale one refreshed in the background. Nothing found is nothing said - an account that
+    could not be read must not arrive as a balance of zero.
     """
     try:
-        from agent.account_usage import _snapshot_from_credits_state, render_account_usage_lines
+        from agent.account_usage import (
+            _snapshot_from_credits_state,
+            build_nous_credits_snapshot,
+            render_account_usage_lines,
+        )
     except Exception:
         logger.debug("account usage ▸ imports unavailable", exc_info=True)
         return None
     provider = str(getattr(agent, "provider", "") or "").strip().lower()
     stale = False
     snapshot = _snapshot_from_credits_state(getattr(agent, "_credits_state", None))
-    if snapshot is None:
-        if not provider:
+    if snapshot is not None:
+        lines = _account_lines(snapshot, render_account_usage_lines)
+        return {"provider": provider or None, "lines": lines, "stale": stale} if lines else None
+    if provider == "nous":
+        # Nous has no entry in the account cache's fetcher table - its block is the portal's own, and the
+        # portal is asked at most once a minute. Until the answer is in, the turn says nothing.
+        remembered = _remembered_nous_account()
+        if remembered is None:
+            _warm_nous_account_cache()
             return None
+        return {"provider": "nous", "lines": remembered, "stale": False}
+    if provider:
         try:
             from agent.account_usage_cache import (
                 cached_account_usage,
@@ -140,17 +213,10 @@ def _account_usage_meta(agent: Any) -> dict[str, Any] | None:
         stale = snapshot_is_stale(snapshot)
         if stale:
             refresh_account_usage_async([provider])
-    # `_snapshot_from_credits_state` is written for the dev fixture and says so in a tail line; a live
-    # account is not a fixture, and a balance that arrives with a lie beside it is worse than none. Every
-    # other line is the account's own, exactly as `/usage` prints it.
-    lines = [
-        str(line)
-        for line in render_account_usage_lines(snapshot)
-        if str(line).strip() and "HERMES_DEV_CREDITS_FIXTURE" not in str(line)
-    ]
-    if not lines:
-        return None
-    return {"provider": provider or None, "lines": lines, "stale": stale}
+        lines = _account_lines(snapshot, render_account_usage_lines)
+        return {"provider": provider, "lines": lines, "stale": stale} if lines else None
+    return None
+
 
 # role -> (chunk class, session_update tag) for history replay.
 _HISTORY_CHUNK_TYPES = {
