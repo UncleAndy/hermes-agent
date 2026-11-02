@@ -27,23 +27,35 @@ def arm() -> None:
     import inspect
     import sys
 
-    def find(mod):
+    # The SDK module holding the notification method is not imported by the time a door is imported, so
+    # pull it in rather than hope for it - and take the class that actually defines the method (it may be
+    # inherited), which is the one whose attribute is looked up at call time.
+    for module_name in ("acp.agent.connection", "acp.client.connection", "acp.connection", "acp.schema"):
         try:
-            items = list(vars(mod).items())
+            __import__(module_name)
         except Exception:
-            return None
-        for _name, _obj in items:
-            if inspect.isclass(_obj) and "session_update" in getattr(_obj, "__dict__", {}):
-                return _obj
+            continue
+
+    def defining_class(cls):
+        for base in getattr(cls, "__mro__", []):
+            if "session_update" in getattr(base, "__dict__", {}):
+                return base
         return None
 
     targets = []
     for name, mod in list(sys.modules.items()):
         if mod is None or not (name == "acp" or name.startswith("acp.")):
             continue
-        cls = find(mod)
-        if cls is not None and cls not in targets:
-            targets.append(cls)
+        try:
+            items = list(vars(mod).items())
+        except Exception:
+            continue
+        for _name, _obj in items:
+            if not inspect.isclass(_obj):
+                continue
+            owner = defining_class(_obj)
+            if owner is not None and owner not in targets:
+                targets.append(owner)
     _note("armed: %r" % [c.__module__ + "." + c.__name__ for c in targets])
     for cls in targets:
         if getattr(cls, "_hermes_traced", False):
