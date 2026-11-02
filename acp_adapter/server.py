@@ -168,12 +168,18 @@ def _account_usage_meta(agent: Any) -> dict[str, Any] | None:
     a list of labelled lines does not, so a client shows whatever the provider said without knowing the
     provider at all.
 
-    Nothing waits on the network and nothing reads a credential: a provider that accounts for itself in
-    its response (Nous sends ``x-nous-credits-*``) is read from what is already in memory; a Nous account
-    whose headers have not been seen is read from this adapter's own remembered block, filled on a thread
-    the first time; any other provider's last known block comes from the account cache every surface
-    shares, a stale one refreshed in the background. Nothing found is nothing said - an account that
-    could not be read must not arrive as a balance of zero.
+    Nothing waits on the network and nothing reads a credential, and no source is trusted because of where
+    it came from - each one is asked whether it has anything to say:
+
+    1. the agent's own accounting (a provider that reports itself in the response is read from memory);
+    2. the last accounting this process saw (the response hook parses those same headers for whichever
+       agent object it was handed, which is not always the one in front - and a state that is present but
+       carries no figures, like a portal-seeded one with the amounts missing, says as little as none);
+    3. for Nous, the block this adapter remembers (the portal is asked at most once a minute, off the
+       turn's path), and for anyone else the account cache every surface shares.
+
+    Nothing found is nothing said - an account that could not be read must not arrive as a balance of
+    zero - and a turn with nothing to send says so in the log, so the next round is settled by evidence.
     """
     try:
         from agent.account_usage import (
@@ -185,43 +191,32 @@ def _account_usage_meta(agent: Any) -> dict[str, Any] | None:
         logger.debug("account usage ▸ imports unavailable", exc_info=True)
         return None
     provider = str(getattr(agent, "provider", "") or "").strip().lower()
-    stale = False
-    state = getattr(agent, "_credits_state", None)
-    source = "this agent's own accounting"
-    if state is None:
-        global _account_usage_reported
-        if not _account_usage_reported:
-            _account_usage_reported = True
-            logger.warning(
-                "account usage ▸ no credits state on this agent (provider=%s, client=%s, agent=%s)",
-                provider, hasattr(agent, "client"), id(agent),
-            )
-    snapshot = _snapshot_from_credits_state(state)
-    if snapshot is None:
-        # Not this agent's: the response hook parses these headers for whichever agent object it was handed,
-        # and the one holding the conversation is not always the same one. A surface that only wants the
-        # figure reads the last accounting the process saw.
+
+    def lines_of(state: Any) -> list[str]:
+        snapshot = _snapshot_from_credits_state(state)
+        return _account_lines(snapshot, render_account_usage_lines) if snapshot is not None else []
+
+    lines = lines_of(getattr(agent, "_credits_state", None))
+    source = "this agent's accounting"
+    if not lines:
         try:
             from agent.credits_tracker import last_response_credits
 
-            snapshot = _snapshot_from_credits_state(last_response_credits())
+            lines = lines_of(last_response_credits())
             source = "the last response this process saw"
         except Exception:
-            logger.warning("account usage ▸ no last-response accounting to fall back on", exc_info=True)
-            snapshot = None
-    if snapshot is not None:
-        lines = _account_lines(snapshot, render_account_usage_lines)
-        if not lines:
-            logger.info("account usage ▸ %s: the account block carried no balance", source)
-            return None
+            logger.warning("account usage ▸ the last-response accounting could not be read", exc_info=True)
+    if lines:
         logger.info("account usage ▸ %s: %d lines to the status line", source, len(lines))
-        return {"provider": provider or None, "lines": lines, "stale": stale}
+        return {"provider": provider or None, "lines": lines, "stale": False}
     if provider == "nous":
-        # Nous has no entry in the account cache's fetcher table - its block is the portal's own, and the
-        # portal is asked at most once a minute. Until the answer is in, the turn says nothing.
+        # Nous has no entry in the account cache's fetcher table - its block is the portal's own - so this
+        # adapter remembers it, and an empty memory is filled off the turn's path.
         remembered = _remembered_nous_account()
         if remembered is None:
             _warm_nous_account_cache()
+            logger.warning("account usage ▸ nothing to send: no accounting on the agent, none in this "
+                           "process, and the portal block is being fetched for a later turn")
             return None
         return {"provider": "nous", "lines": remembered, "stale": False}
     if provider:
@@ -237,12 +232,17 @@ def _account_usage_meta(agent: Any) -> dict[str, Any] | None:
         snapshot = cached_account_usage(provider)
         if snapshot is None:
             refresh_account_usage_async([provider])
+            logger.warning("account usage ▸ nothing to send: %s has no account block cached yet", provider)
             return None
         stale = snapshot_is_stale(snapshot)
         if stale:
             refresh_account_usage_async([provider])
-        lines = _account_lines(snapshot, render_account_usage_lines)
-        return {"provider": provider, "lines": lines, "stale": stale} if lines else None
+        cached_lines = _account_lines(snapshot, render_account_usage_lines)
+        if not cached_lines:
+            logger.warning("account usage ▸ %s's cached block carries no balance", provider)
+            return None
+        return {"provider": provider, "lines": cached_lines, "stale": stale}
+    logger.warning("account usage ▸ nothing to send: the agent names no provider")
     return None
 
 
