@@ -20,19 +20,26 @@ def _chat_completion_capturing_headers(agent, client, api_kwargs: dict):
     captured only when the response itself is the usage-window kind. A capture failure never
     fails the turn.
     """
-    # `is True`: a Mock agent's invented attribute is not a window plan.
-    state = getattr(agent, "_credits_state", None)
-    if getattr(agent, "provider", "") != "nous" or getattr(state, "is_usage_window", False) is not True:
+    # Every Nous response, not only a usage-window plan's. The headers are the one place a top-up
+    # balance is reported at all - the portal has stopped carrying the amounts - and the old gate waited
+    # on `_credits_state.is_usage_window`, which is itself only ever established from these headers: an
+    # ordinary account never escaped the chicken and its balance never reached a client.
+    if getattr(agent, "provider", "") != "nous":
         return client.chat.completions.create(**api_kwargs)
     raw_api = getattr(getattr(getattr(client, "chat", None), "completions", None), "with_raw_response", None)
     if raw_api is None:
         return client.chat.completions.create(**api_kwargs)
     raw = raw_api.create(**api_kwargs)
     from agent.credits_tracker import response_is_usage_window
-    if not response_is_usage_window(raw):
-        return raw.parse()
-    for capture in (agent._capture_rate_limits, agent._capture_credits,
-                    agent._capture_nous_model_switch, agent._check_openrouter_cache_status):
+    window = response_is_usage_window(raw)
+    if window:
+        captures = (agent._capture_rate_limits, agent._capture_credits,
+                    agent._capture_nous_model_switch, agent._check_openrouter_cache_status)
+    else:
+        # An ordinary account's response: the rate-limit and window captures have nothing to do, but the
+        # credits are here and only here.
+        captures = (agent._capture_credits,)
+    for capture in captures:
         try:
             capture(raw)
         except Exception:
