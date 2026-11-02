@@ -44,7 +44,20 @@ def install_served_model_capture(agent: Any, client: Any) -> None:
     def _on_response(response: Any) -> None:
         try:
             if 200 <= int(getattr(response, "status_code", 0)) < 300:
-                agent.last_served_model = served_model_from_headers(getattr(response, "headers", None))
+                headers = getattr(response, "headers", None)
+                agent.last_served_model = served_model_from_headers(headers)
+                # The account is reported in these same headers and nowhere else a surface can reach,
+                # and every money surface reads it from the credits state. Captured here, on the one
+                # hook every primary client passes through, so no call path has to remember to: a
+                # non-streaming turn, a stream, a recovery - the balance lands either way.
+                try:
+                    from agent.credits_tracker import parse_credits_headers
+
+                    state = parse_credits_headers(headers, provider=str(getattr(agent, "provider", "") or ""))
+                    if state is not None:
+                        agent._credits_state = state
+                except Exception:
+                    logger.debug("credits header capture skipped", exc_info=True)
         except Exception:
             logger.debug("served-model header capture skipped", exc_info=True)
 
