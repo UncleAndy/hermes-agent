@@ -184,10 +184,29 @@ def _account_usage_meta(agent: Any) -> dict[str, Any] | None:
         return None
     provider = str(getattr(agent, "provider", "") or "").strip().lower()
     stale = False
-    snapshot = _snapshot_from_credits_state(getattr(agent, "_credits_state", None))
+    state = getattr(agent, "_credits_state", None)
+    source = "the last response's own accounting"
+    if state is None:
+        # Whether the per-response capture ran is Hermes-internal; the response itself is not. The last
+        # attempt's headers carry the whole account, so they are read here rather than showing nothing
+        # while the capture's own reason stays invisible.
+        headers = getattr(getattr(agent, "_attempt_stream_response", None), "headers", None)
+        if headers:
+            try:
+                from agent.credits_tracker import parse_credits_headers
+
+                state = parse_credits_headers(headers, provider=provider)
+                source = "the headers of the last response"
+            except Exception:
+                logger.debug("account usage ▸ header parse failed", exc_info=True)
+    snapshot = _snapshot_from_credits_state(state)
     if snapshot is not None:
         lines = _account_lines(snapshot, render_account_usage_lines)
-        return {"provider": provider or None, "lines": lines, "stale": stale} if lines else None
+        if not lines:
+            logger.info("account usage ▸ %s: the account block carried no balance", source)
+            return None
+        logger.info("account usage ▸ %s: %d lines to the status line", source, len(lines))
+        return {"provider": provider or None, "lines": lines, "stale": stale}
     if provider == "nous":
         # Nous has no entry in the account cache's fetcher table - its block is the portal's own, and the
         # portal is asked at most once a minute. Until the answer is in, the turn says nothing.
