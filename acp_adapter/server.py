@@ -159,7 +159,7 @@ def _account_lines(snapshot: Any, render: Any) -> list[str]:
     ]
 
 
-def _account_usage_meta(agent: Any) -> dict[str, Any] | None:
+def _account_usage_meta(agent: Any = None, provider: str | None = None) -> dict[str, Any] | None:
     """What the account says, in the provider's own words, for ``_meta.hermes.accountUsage``.
 
     The lines, and not fields, because that is the shape every money surface already shares: ``/usage``
@@ -190,14 +190,14 @@ def _account_usage_meta(agent: Any) -> dict[str, Any] | None:
     except Exception:
         logger.debug("account usage ▸ imports unavailable", exc_info=True)
         return None
-    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    provider = str(provider or getattr(agent, "provider", "") or "").strip().lower()
 
     def lines_of(state: Any) -> list[str]:
         snapshot = _snapshot_from_credits_state(state)
         return _account_lines(snapshot, render_account_usage_lines) if snapshot is not None else []
 
     lines = lines_of(getattr(agent, "_credits_state", None))
-    source = "this agent's accounting"
+    source = "this agent's accounting" 
     if not lines:
         try:
             from agent.credits_tracker import last_response_credits

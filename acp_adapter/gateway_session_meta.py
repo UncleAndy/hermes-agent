@@ -138,11 +138,26 @@ def provenance_meta(db_path: Path, acp_session_id: str, session_id: str) -> dict
 # ``session.usage`` event published after every API call and at turn end, or ``session.stats``.
 
 def usage_update(stats: dict) -> UsageUpdate | None:
-    """Zed's context indicator: ``size`` the context window, ``used`` its current occupancy."""
+    """Zed's context indicator: ``size`` the context window, ``used`` its current occupancy.
+
+    The account rides with it as ``_meta.hermes.accountUsage``, the same place the native adapter puts it:
+    an editor's status line shows what is left on the account without knowing which door the session came
+    in through. The figure is the last one any response reported, read from memory - nothing here waits on
+    a network, and nothing found is nothing said."""
     size = stats.get("context_length")
     if type(size) is not int or size <= 0:
         return None
-    return UsageUpdate(session_update="usage_update", size=size, used=max(int(stats.get("context_tokens") or 0), 0))
+    account = None
+    try:
+        from acp_adapter.server import _account_usage_meta
+
+        account = _account_usage_meta(None, provider=stats.get("provider"))
+    except Exception:
+        logger.debug("account usage ▸ the gateway projection could not read it", exc_info=True)
+    return UsageUpdate(
+        session_update="usage_update", size=size, used=max(int(stats.get("context_tokens") or 0), 0),
+        field_meta={"hermes": {"accountUsage": account}} if account else None,
+    )
 
 
 def turn_usage(stats) -> Usage | None:
