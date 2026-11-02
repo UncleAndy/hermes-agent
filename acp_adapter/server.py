@@ -1243,12 +1243,3 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         self.session_manager.save_session(session_id)
         logger.info("Session %s: config option %s updated", session_id, config_id)
         return SetSessionConfigOptionResponse(config_options=[])
-
-
-# Temporary diagnostic: arm the ACP notification tracer so a send can be attributed (acp_adapter/_send_trace).
-try:
-    from acp_adapter._send_trace import arm as _arm_send_trace
-
-    _arm_send_trace()
-except Exception:  # pragma: no cover - never let a diagnostic break a door
-    pass
