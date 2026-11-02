@@ -1223,3 +1223,12 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             await asyncio.gather(*self._permissions.values(), return_exceptions=True)
             self._permissions.clear()
         await self._teardown()
+
+
+# Temporary diagnostic: arm the ACP notification tracer so a send can be attributed (acp_adapter/_send_trace).
+try:
+    from acp_adapter._send_trace import arm as _arm_send_trace
+
+    _arm_send_trace()
+except Exception:  # pragma: no cover - never let a diagnostic break a door
+    pass
