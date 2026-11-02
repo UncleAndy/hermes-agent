@@ -147,13 +147,15 @@ def usage_update(stats: dict) -> UsageUpdate | None:
     size = stats.get("context_length")
     if type(size) is not int or size <= 0:
         return None
-    account = None
-    try:
-        from acp_adapter.server import _account_usage_meta
+    account = stats.get("account_usage") if isinstance(stats, dict) else None
+    if not account:
+        # What the owner published wins: this process only ever sees the responses another one made.
+        try:
+            from acp_adapter.server import _account_usage_meta
 
-        account = _account_usage_meta(None, provider=stats.get("provider"))
-    except Exception:
-        logger.debug("account usage ▸ the gateway projection could not read it", exc_info=True)
+            account = _account_usage_meta(None, provider=stats.get("provider"))
+        except Exception:
+            logger.debug("account usage ▸ the gateway projection could not read it", exc_info=True)
     return UsageUpdate(
         session_update="usage_update", size=size, used=max(int(stats.get("context_tokens") or 0), 0),
         field_meta={"hermes": {"accountUsage": account}} if account else None,

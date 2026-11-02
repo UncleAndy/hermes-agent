@@ -973,3 +973,46 @@ def fetch_account_usage(
     remember_account_usage(provider, snapshot, identity_id=identity_id, base_url=base_url,
                            started_monotonic=started)
     return snapshot
+
+
+import contextlib as _contextlib  # noqa: E402 - a late import keeps the addition self-contained
+
+
+def response_account_usage(provider: Optional[str] = None, agent: Any = None) -> Optional[dict]:
+    """The account as labelled lines, readable by a surface that has no agent in hand.
+
+    The response's own accounting is parsed by the served-model hook in whichever process makes the model
+    call; the process that projects a session's figures to an editor is not that process, so the account has
+    to travel with those figures rather than be looked up again on the far side. Nothing waits on a network
+    and nothing reads a credential; nothing found is nothing said, and a dev fixture is never an account.
+    """
+    where = str(provider or getattr(agent, "provider", "") or "").strip().lower()
+
+    def block(state: Any) -> Optional[dict]:
+        try:
+            snapshot = _snapshot_from_credits_state(state)
+        except Exception:
+            return None
+        if snapshot is None:
+            return None
+        lines = [ln for ln in render_account_usage_lines(snapshot) if "HERMES_DEV_CREDITS_FIXTURE" not in ln]
+    # a dev fixture must never be mistaken for a balance, and an unreadable state is not an error
+        if not lines:
+            return None
+        return {"provider": where or None, "lines": lines, "stale": False}
+
+    for state in (getattr(agent, "_credits_state", None),):
+        if state is not None and (found := block(state)) is not None:
+            return found
+    with _contextlib.suppress(Exception):
+        from agent.credits_tracker import last_response_credits
+
+        if (found := block(last_response_credits())) is not None:
+            return found
+    if where:
+        with _contextlib.suppress(Exception):
+            from agent.account_usage_cache import cached_account_usage
+
+            if (found := block(cached_account_usage(where))) is not None:
+                return found
+    return None

@@ -100,6 +100,13 @@ def usage_stats(agent) -> dict:
                  if getattr(agent, "_fallback_activated", False) is True else None)
     if (gauge := plan_gauge(agent)) is not None:  # absent off a window plan, as on the embedded path
         stats["plan_gauge"] = gauge
+    # The account rides here because the response hook filled it in *this* process's memory: the viewer that
+    # projects these figures into an editor runs elsewhere and could not read it for itself.
+    with contextlib.suppress(Exception):
+        from agent.account_usage import response_account_usage
+
+        if (account := response_account_usage(str(getattr(agent, "provider", "") or ""), agent)) is not None:
+            stats["account_usage"] = account
     return stats
 
 
