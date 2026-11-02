@@ -674,6 +674,25 @@ _DEV_FIXTURES: dict[str, dict] = {
 }
 
 
+# The last accounting a response carried, kept where any surface can reach it. The response hook parses
+# the headers, and an editor's status line reads the result without having to be handed the very agent
+# object the hook happened to be given.
+_last_response_credits: Optional[CreditsState] = None
+
+
+def remember_response_credits(state: Optional[CreditsState]) -> None:
+    """Keeps a response's own accounting as the last one any surface can read."""
+    global _last_response_credits
+
+    if state is not None:
+        _last_response_credits = state
+
+
+def last_response_credits() -> Optional[CreditsState]:
+    """The accounting of the last response this process saw, or None if it saw none."""
+    return _last_response_credits
+
+
 def dev_fixture_credits_state() -> Optional[CreditsState]:
     """Fixture CreditsState for HERMES_DEV_CREDITS_FIXTURE, or None (unknown name / unset). Prod-leak guard:
     applies ONLY when HERMES_DEV_CREDITS is also on, so a stray fixture env var never surfaces fabricated balances."""

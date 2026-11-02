@@ -64,11 +64,14 @@ def install_served_model_capture(agent: Any, client: Any) -> None:
                     state = parse_credits_headers(headers, provider=str(getattr(agent, "provider", "") or ""))
                     if state is not None:
                         agent._credits_state = state
+                        from agent.credits_tracker import remember_response_credits
+
+                        remember_response_credits(state)
                     if not _credits_capture_reported:
                         _credits_capture_reported = True
                         if state is not None:
-                            logger.warning("credits ▸ capture ok: purchased_usd=%s (%d nous headers)",
-                                           state.purchased_usd, len(names))
+                            logger.warning("credits ▸ capture ok: purchased_usd=%s (%d nous headers, agent=%s)",
+                                           state.purchased_usd, len(names), id(agent))
                         elif names:
                             logger.warning("credits ▸ %d nous headers on the response, none parsed: %s",
                                            len(names), names[:4])

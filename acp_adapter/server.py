@@ -187,16 +187,28 @@ def _account_usage_meta(agent: Any) -> dict[str, Any] | None:
     provider = str(getattr(agent, "provider", "") or "").strip().lower()
     stale = False
     state = getattr(agent, "_credits_state", None)
-    source = "the last response's own accounting"
+    source = "this agent's own accounting"
     if state is None:
         global _account_usage_reported
         if not _account_usage_reported:
             _account_usage_reported = True
             logger.warning(
-                "account usage ▸ the agent has no credits state (provider=%s, client=%s)",
-                provider, hasattr(agent, "client"),
+                "account usage ▸ no credits state on this agent (provider=%s, client=%s, agent=%s)",
+                provider, hasattr(agent, "client"), id(agent),
             )
     snapshot = _snapshot_from_credits_state(state)
+    if snapshot is None:
+        # Not this agent's: the response hook parses these headers for whichever agent object it was handed,
+        # and the one holding the conversation is not always the same one. A surface that only wants the
+        # figure reads the last accounting the process saw.
+        try:
+            from agent.credits_tracker import last_response_credits
+
+            snapshot = _snapshot_from_credits_state(last_response_credits())
+            source = "the last response this process saw"
+        except Exception:
+            logger.warning("account usage ▸ no last-response accounting to fall back on", exc_info=True)
+            snapshot = None
     if snapshot is not None:
         lines = _account_lines(snapshot, render_account_usage_lines)
         if not lines:
