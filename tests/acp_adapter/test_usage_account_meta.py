@@ -49,3 +49,27 @@ def test_a_provider_with_no_account_to_show_says_nothing(monkeypatch):
 
 def test_an_agent_with_no_provider_at_all_says_nothing():
     assert _account_usage_meta(_Agent(credits_state=None, provider="")) is None
+
+
+def test_an_account_of_another_provider_is_not_sent(monkeypatch):
+    # Andy works on one provider for days, and this process keeps the accounting of the last response it
+    # saw - whoever made it. Nous numbers handed to a turn on opencode-go are a balance nobody there can
+    # spend: nothing is said at all, and the editor shows its dash.
+    from agent import credits_tracker
+
+    monkeypatch.setattr("agent.account_usage_cache.cached_account_usage", lambda *a, **k: None)
+    monkeypatch.setattr("agent.account_usage_cache.refresh_account_usage_async", lambda *a, **k: [])
+    monkeypatch.setattr(credits_tracker, "_last_response_credits", _credits_from_headers())
+    monkeypatch.setattr(credits_tracker, "_last_response_provider", "nous")
+    assert _account_usage_meta(_Agent(credits_state=None, provider="opencode-go")) is None
+
+
+def test_the_account_of_the_provider_in_front_travels_with_its_own_name(monkeypatch):
+    from agent import credits_tracker
+
+    monkeypatch.setattr(credits_tracker, "_last_response_credits", _credits_from_headers())
+    monkeypatch.setattr(credits_tracker, "_last_response_provider", "nous")
+    meta = _account_usage_meta(_Agent(credits_state=None, provider="nous"))
+    assert meta is not None, "the account of the provider in front was not sent"
+    assert meta["provider"] == "nous", meta
+    assert "Top-up credits: $14.06" in meta["lines"], meta["lines"]

@@ -678,19 +678,47 @@ _DEV_FIXTURES: dict[str, dict] = {
 # the headers, and an editor's status line reads the result without having to be handed the very agent
 # object the hook happened to be given.
 _last_response_credits: Optional[CreditsState] = None
+# The provider that served that response. The accounting is the money of whoever answered, and a surface
+# showing it for a turn on another provider would be showing a balance nobody there can spend.
+_last_response_provider: Optional[str] = None
 
 
-def remember_response_credits(state: Optional[CreditsState]) -> None:
-    """Keeps a response's own accounting as the last one any surface can read."""
-    global _last_response_credits
+def remember_response_credits(state: Optional[CreditsState], provider: Optional[str] = None) -> None:
+    """Keeps a response's own accounting, and the provider it was served by, as the last one any surface
+    can read."""
+    global _last_response_credits, _last_response_provider
 
     if state is not None:
         _last_response_credits = state
+        named = str(provider or "").strip().lower()
+        _last_response_provider = named or None
 
 
 def last_response_credits() -> Optional[CreditsState]:
     """The accounting of the last response this process saw, or None if it saw none."""
     return _last_response_credits
+
+
+def last_response_provider() -> Optional[str]:
+    """The provider that served the response whose accounting ``last_response_credits`` holds."""
+    return _last_response_provider
+
+
+def account_of_agent(agent: Any, provider: Optional[str] = None) -> Optional[CreditsState]:
+    """The accounting an agent carries, when it was served by *provider*.
+
+    An agent keeps the last accounting it saw together with the provider that served it: a session moved
+    to another provider still holds the numbers of the one before until a new response arrives, and those
+    numbers are the money of the provider that answered, not of the one in front.
+    """
+    state = getattr(agent, "_credits_state", None)
+    if state is None:
+        return None
+    owner = str(getattr(agent, "_credits_provider", "") or "").strip().lower()
+    where = str(provider or "").strip().lower()
+    if owner and where and owner != where:
+        return None
+    return state
 
 
 def dev_fixture_credits_state() -> Optional[CreditsState]:

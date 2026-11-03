@@ -196,19 +196,41 @@ def _account_usage_meta(agent: Any = None, provider: str | None = None) -> dict[
         snapshot = _snapshot_from_credits_state(state)
         return _account_lines(snapshot, render_account_usage_lines) if snapshot is not None else []
 
-    lines = lines_of(getattr(agent, "_credits_state", None))
-    source = "this agent's accounting" 
+    # The agent keeps the last accounting it saw, and the provider that served it: a session moved to
+    # another provider still holds the numbers of the one before until a new response arrives.
+    try:
+        from agent.credits_tracker import account_of_agent
+
+        lines = lines_of(account_of_agent(agent, provider))
+    except Exception:
+        lines = lines_of(getattr(agent, "_credits_state", None))
+    source = "this agent's accounting"
+    lines_provider = provider or None
     if not lines:
         try:
-            from agent.credits_tracker import last_response_credits
+            from agent.credits_tracker import last_response_credits, last_response_provider
 
-            lines = lines_of(last_response_credits())
-            source = "the last response this process saw"
+            # The process keeps the accounting of the last response it saw, and that response was not
+            # necessarily made by the provider in front. Its numbers are the money of whoever answered:
+            # handed to a turn on another provider they would be a balance nobody there can spend, so
+            # nothing is said at all - an editor shows its dash, which is what a provider that reports
+            # no balance looks like.
+            seen_by = last_response_provider()
+            if seen_by and provider and seen_by != provider:
+                logger.info(
+                    "account usage ▸ the last accounting in this process belongs to %s, not to %s: nothing to send",
+                    seen_by,
+                    provider,
+                )
+            else:
+                lines = lines_of(last_response_credits())
+                source = "the last response this process saw"
+                lines_provider = seen_by or provider or None
         except Exception:
             logger.warning("account usage ▸ the last-response accounting could not be read", exc_info=True)
     if lines:
         logger.info("account usage ▸ %s: %d lines to the status line", source, len(lines))
-        return {"provider": provider or None, "lines": lines, "stale": False}
+        return {"provider": lines_provider, "lines": lines, "stale": False}
     if provider == "nous":
         # Nous has no entry in the account cache's fetcher table - its block is the portal's own - so this
         # adapter remembers it, and an empty memory is filled off the turn's path.
