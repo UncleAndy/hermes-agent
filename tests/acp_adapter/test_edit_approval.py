@@ -124,6 +124,59 @@ def test_workspace_auto_approval_allows_workspace_and_tmp_but_not_sensitive(tmp_
     )
 
 
+def test_workspace_auto_approval_covers_the_agents_own_home(tmp_path, monkeypatch):
+    """An agent's own home is its own.
+
+    A session opened on a project used to ask about every edit outside that project, and the agent's
+    own home — where its skills, memory and scratch live — was one of them: a person sees a prompt to
+    edit a file the agent keeps for itself. Sensitive paths still ask, so keys and secrets in the home
+    stay behind the prompt.
+    """
+    home = tmp_path / "agent-home"
+    state = tmp_path / "agent-state"
+    (home / "skills").mkdir(parents=True)
+    state.mkdir()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setenv("HERMES_HOME", str(state))
+    monkeypatch.setattr("acp_adapter.edit_approval.HOMES_ROOT", tmp_path / "homes")
+
+    def approved(path: Path, policy: str = "workspace_session") -> bool:
+        return should_auto_approve_edit(
+            EditProposal("write_file", str(path), None, "x", {}), policy, str(workspace)
+        )
+
+    assert approved(home / "skills" / "lesson.md"), "an edit in the agent's own home still asks"
+    assert approved(state / "cache" / "scratch" / "note.md"), "an edit in HERMES_HOME still asks"
+    assert approved(workspace / "src.py"), "an edit in the workspace stopped being approved"
+    assert not approved(home / ".ssh" / "config"), "a key in the agent's home stopped asking"
+    assert not approved(home / ".env"), "a .env in the agent's home stopped asking"
+    assert not approved(home / "skills" / "lesson.md", "ask"), "the ask mode approved an edit"
+
+
+def test_a_home_that_keeps_hermes_state_is_an_agent_home(tmp_path, monkeypatch):
+    """The process has the wrong home in a container: root's home is ``/root`` while the agent lives in
+    ``/home/hermes``, mounted from the host. A home that keeps a ``.hermes`` of its own is the agent's;
+    the operator's home keeps none, so it is not swept in."""
+    homes = tmp_path / "homes"
+    agent = homes / "agent"
+    operator = homes / "operator"
+    (agent / ".hermes").mkdir(parents=True)
+    operator.mkdir(parents=True)
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.setattr("acp_adapter.edit_approval.HOMES_ROOT", homes)
+
+    def approved(path: Path) -> bool:
+        return should_auto_approve_edit(
+            EditProposal("write_file", str(path), None, "x", {}), "workspace_session", str(workspace)
+        )
+
+    assert approved(agent / "notes.md"), "an edit in the agent's mounted home still asks"
+    assert not approved(operator / "notes.md"), "a home with no .hermes was approved"
+
+
 def test_multifile_v4a_patch_checks_every_real_path_not_the_joined_display_string(tmp_path):
     """Multi-file V4A proposals carry a comma-joined ``path`` for the dialog; the auto-approve
     checks must run per real target so a sensitive or escaping file cannot hide in the join (#115213)."""
