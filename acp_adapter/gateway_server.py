@@ -88,6 +88,9 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         # Session -> editor MCP servers a replacement connection must re-attach.
         self._editor_mcp = {}
         self._permissions = {}
+        # The compaction a session is in the middle of, by session: its id has to be the same for the
+        # start and the end of one compaction, and a different one for the next.
+        self._compactions = {}
         self._admissions = {}
         self._submitting = set()
         # Session -> (content fingerprint, input_id, staged (text, attachments)) of a submit whose ack
@@ -977,6 +980,9 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             return
         if kind in {"reasoning.delta", "todo.updated"}:
             await self._project_side_update(kind, sid, editor_id, payload)
+            return
+        if kind == "compaction.update":
+            await self._project_compaction(sid, editor_id, payload)
             return
         if kind in {"tool.start", "tool.complete"}:
             await self._project_tool(kind, sid, editor_id, aid, payload)

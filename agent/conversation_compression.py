@@ -90,8 +90,25 @@ def _strip_marker_for_comparison(msgs: Any) -> Any:
     return [{k: v for k, v in m.items() if k != _DB_PERSISTED_MARKER} if isinstance(m, dict) else m for m in msgs]
 
 
+def _emit_compaction(agent: Any, phase: str, text: str = "") -> None:
+    """Tell a surface that asked for the compression lifecycle what just happened.
+
+    The status line carries the sentence, and a chat surface is content with it. A surface that has
+    to *act* on a compaction — an editor holding its input while the context is summarized, a client
+    that has to know when the work is over — needs it as a fact rather than as words to parse, and
+    nothing on the ACP wire carries one today. The callback is optional: an agent without one (a CLI,
+    a platform that only shows the sentence) behaves exactly as before.
+    """
+    callback = getattr(agent, "compaction_callback", None)
+    if not callable(callback):
+        return
+    with _swallow("compaction_callback error"):
+        callback(phase, text)
+
+
 def _emit_compaction_done(agent: Any) -> None:
     """Emit the structured terminal edge for a started compaction."""
+    _emit_compaction(agent, "done", COMPACTION_DONE_STATUS)
     status_callback = getattr(agent, "status_callback", None)
     if not status_callback:
         return
@@ -1803,6 +1820,7 @@ class _CompressionActivityHeartbeat:
             return
         try:
             emit(COMPACTION_HEARTBEAT_STATUS)
+            _emit_compaction(self._agent, "still", COMPACTION_HEARTBEAT_STATUS)
         except Exception:
             logger.debug(
                 "status emit error in compression heartbeat", exc_info=True
@@ -2538,7 +2556,12 @@ class _CompactionLifecycle:
         # cancelled fence) opt in via force_terminal so clients can retire their phase.
         # Failure warnings go through _emit_warning and are never suppressed here.
         if self.status_emitted and (self.commit_status == "committed" or force_terminal):
-            _emit_compaction_done(self._agent)
+            if self.commit_status == "committed":
+                _emit_compaction_done(self._agent)
+            else:
+                # Retiring a phase nobody finished: the surface holding its input has to be let go,
+                # and silence is what would keep it holding.
+                _emit_compaction(self._agent, "aborted", "")
 
 
 class _CompressionLease:
@@ -3983,6 +4006,7 @@ def _announce_compression_start(
         )
     if status:
         agent._emit_status(status)
+        _emit_compaction(agent, "started", status)
     return _CompactionLifecycle(agent, bool(status))
 
 

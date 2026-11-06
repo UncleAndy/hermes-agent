@@ -927,6 +927,27 @@ class GatewayTurnProgressMixin:
         if key and self._status_live():
             self._publish_execution("notification.clear", {"key": str(key)})
 
+    def _compaction_callback_sync(self, phase: str, text: str = "") -> None:
+        """The compression lifecycle, as a fact for a viewer rather than a sentence for a chat.
+
+        A chat surface is told by the status line and stops there. A viewer that has to hold its
+        input while the context is summarized needs to know when the compaction starts and ends,
+        which no ACP session update carries today — the protocol's ``compaction_update`` is still a
+        draft and this SDK (agent-client-protocol 0.9.0) does not carry it at all. So the phase goes
+        onto the session's own execution stream, and the ACP child projects it as
+        ``_meta.hermes.compaction``, the additive extension ``sessionProvenance`` already uses.
+
+        Gated on ``local_viewer_turn`` and **not** on ``_status_live()``: a viewer has no chat
+        adapter to send a status line through, which is why the statuses it does not need are
+        dropped there and this one must not be.
+        """
+        if not local_viewer_turn(self):
+            return
+        phase = str(phase or "")
+        if phase not in {"started", "still", "done", "aborted"}:
+            return
+        self._publish_execution("compaction.update", {"phase": phase, "text": str(text or "")})
+
     def _status_live(self) -> bool:
         """Status adapter present and this run is still the current generation."""
         return bool(self._ctx._status_adapter) and self._ctx._run_still_current()

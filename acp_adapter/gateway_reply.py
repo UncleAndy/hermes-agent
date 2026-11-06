@@ -4,6 +4,7 @@ permission bubbles closed as the in-process agent closed them. Mixed into ``Gate
 from __future__ import annotations
 
 import logging
+import uuid
 
 import acp
 
@@ -91,6 +92,43 @@ class GatewayReplyMixin:
                 if isinstance(todos, list) else None
         if update is not None and self._conn:
             await self._conn.session_update(session_id=editor_id, update=update)
+
+    async def _project_compaction(self, sid, editor_id, payload):
+        """A compaction's phase as ``_meta.hermes.compaction`` on a ``session_info_update``.
+
+        The protocol grew ``compaction_update`` for exactly this, but it is still a draft and
+        ``agent-client-protocol`` 0.9.0 carries no such type — so the word rides the additive
+        ``_meta.hermes`` extension, the way ``sessionProvenance`` does. A client that knows it writes
+        a row and can hold its input while ``in_progress``; every other client ignores the key and
+        sees the session info update it has always seen.
+        """
+        from acp.schema import SessionInfoUpdate
+
+        status = {"started": "in_progress", "still": "in_progress",
+                  "done": "completed", "aborted": "cancelled"}.get(str(payload.get("phase") or ""))
+        if status is None:
+            return
+        if status == "in_progress":
+            compaction_id = self._compactions.get(sid) or uuid.uuid4().hex
+            self._compactions[sid] = compaction_id
+        else:
+            compaction_id = self._compactions.pop(sid, None)
+            if compaction_id is None:
+                # An end for a compaction nobody saw start: nothing to retire on the client's side.
+                return
+        if not self._conn:
+            return
+        await self._conn.session_update(
+            session_id=editor_id,
+            update=SessionInfoUpdate(
+                session_update="session_info_update",
+                field_meta={"hermes": {"compaction": {
+                    "id": compaction_id,
+                    "status": status,
+                    "text": str(payload.get("text") or ""),
+                }}},
+            ),
+        )
 
     def _close_segment(self, aid):
         streamed = self._streamed.pop(aid, "")
