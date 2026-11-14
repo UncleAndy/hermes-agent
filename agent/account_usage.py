@@ -988,7 +988,7 @@ def response_account_usage(provider: Optional[str] = None, agent: Any = None) ->
     """
     where = str(provider or getattr(agent, "provider", "") or "").strip().lower()
 
-    def block(state: Any) -> Optional[dict]:
+    def block(state: Any, owner: Optional[str] = None) -> Optional[dict]:
         try:
             snapshot = _snapshot_from_credits_state(state)
         except Exception:
@@ -999,16 +999,25 @@ def response_account_usage(provider: Optional[str] = None, agent: Any = None) ->
     # a dev fixture must never be mistaken for a balance, and an unreadable state is not an error
         if not lines:
             return None
-        return {"provider": where or None, "lines": lines, "stale": False}
+        return {"provider": owner or where or None, "lines": lines, "stale": False}
 
-    for state in (getattr(agent, "_credits_state", None),):
-        if state is not None and (found := block(state)) is not None:
-            return found
+    # The agent keeps the last accounting it saw, and the provider that served it: a session moved to
+    # another provider still holds the numbers of the one before until a new response arrives.
     with _contextlib.suppress(Exception):
-        from agent.credits_tracker import last_response_credits
+        from agent.credits_tracker import account_of_agent
 
-        if (found := block(last_response_credits())) is not None:
-            return found
+        for state in (account_of_agent(agent, where),):
+            if state is not None and (found := block(state)) is not None:
+                return found
+    with _contextlib.suppress(Exception):
+        from agent.credits_tracker import last_response_credits, last_response_provider
+
+        # The last response this process saw was not necessarily made by the provider in front: its
+        # numbers are the money of whoever answered, and a turn on another provider must not wear them.
+        seen_by = last_response_provider()
+        if not (seen_by and where and seen_by != where):
+            if (found := block(last_response_credits(), seen_by)) is not None:
+                return found
     if where:
         with _contextlib.suppress(Exception):
             from agent.account_usage_cache import cached_account_usage

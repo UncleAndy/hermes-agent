@@ -30,9 +30,10 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_compressor_summary import _accepts_keyword_argument
-from agent.context_engine import automatic_compaction_status_message, sanitize_memory_context
+from agent.context_engine import CompactionProgressText, automatic_compaction_status_message, sanitize_memory_context
 from agent.conversation_compression_codex import _compress_context_via_codex_app_server
 from agent.conversation_compression_deadline import resolve_context_compression_timeouts
+from agent.conversation_compression_scaffolding import _SYNTHETIC_USER_FLAGS, _message_text, is_user_role_scaffolding
 from agent.conversation_compression_telemetry import (
     _emit_aborted_attempt_telemetry, _emit_blocked_attempt_telemetry, _emit_bypassed_attempt_telemetry,
     _emit_compression_attempt_telemetry, _record_committed_attempt_effect, _snapshot_compression_effect_input,
@@ -69,13 +70,15 @@ _TERMINAL_COMPRESSION_PROVENANCES = frozenset(
 # B).
 _SPLIT_FAILURE_COOLDOWN_SECONDS = 60
 
-# Marker tui_gateway/server.py::_status_update matches to tag kind="compacting" for drivers' "Summarizing…" UI. Keep
-# the phrase intact when rewording. Idle/preflight/retry lines lack it; is_compaction_progress_status covers those.
 COMPACTION_STATUS_MARKER = "Compacting context"
-COMPACTION_STATUS = f"🗜️ {COMPACTION_STATUS_MARKER} — summarizing earlier conversation so I can continue..."
+COMPACTION_STATUS = CompactionProgressText(
+    f"🗜️ {COMPACTION_STATUS_MARKER} — summarizing earlier conversation so I can continue..."
+)
 # Periodic heartbeat re-emitted while a long compression is still running so remote transports with
-# idle-turn watchdogs (#98371) see progress. Same marker as COMPACTION_STATUS so consumers classify it alike.
-COMPACTION_HEARTBEAT_STATUS = f"🗜️ {COMPACTION_STATUS_MARKER} — still summarizing earlier conversation so I can continue..."
+# idle-turn watchdogs (#98371) see progress.
+COMPACTION_HEARTBEAT_STATUS = CompactionProgressText(
+    f"🗜️ {COMPACTION_STATUS_MARKER} — still summarizing earlier conversation so I can continue..."
+)
 
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
 
@@ -90,8 +93,25 @@ def _strip_marker_for_comparison(msgs: Any) -> Any:
     return [{k: v for k, v in m.items() if k != _DB_PERSISTED_MARKER} if isinstance(m, dict) else m for m in msgs]
 
 
+def _emit_compaction(agent: Any, phase: str, text: str = "") -> None:
+    """Tell a surface that asked for the compression lifecycle what just happened.
+
+    The status line carries the sentence, and a chat surface is content with it. A surface that has
+    to *act* on a compaction — an editor holding its input while the context is summarized, a client
+    that has to know when the work is over — needs it as a fact rather than as words to parse, and
+    nothing on the ACP wire carries one today. The callback is optional: an agent without one (a CLI,
+    a platform that only shows the sentence) behaves exactly as before.
+    """
+    callback = getattr(agent, "compaction_callback", None)
+    if not callable(callback):
+        return
+    with _swallow("compaction_callback error"):
+        callback(phase, text)
+
+
 def _emit_compaction_done(agent: Any) -> None:
     """Emit the structured terminal edge for a started compaction."""
+    _emit_compaction(agent, "done", COMPACTION_DONE_STATUS)
     status_callback = getattr(agent, "status_callback", None)
     if not status_callback:
         return
@@ -119,14 +139,15 @@ COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE = "🗜️ Compressed ~{before:,} → ~
 COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE = (
     "🗜️ Context reduced to {new_ctx:,} tokens (was {old_ctx:,}), retrying..."
 )
+# No-op refusal (nothing dropped): chat surfaces suppress it; manual /compress feedback words it differently.
+COMPRESSION_REFUSED_WOULD_GROW_WARNING = ("⚠️ Compression refused: the generated summary would have GROWN the conversation "
+                                          "instead of shrinking it. No messages were dropped — conversation continues unchanged.")
 
-# FAILURE-class notice: compression blocked, so the session grows until the provider limit kills it. Must stay visible
-# on gateways: never add it to ROUTINE_COMPRESSION_STATUS_SAMPLES or _TELEGRAM_NOISY_STATUS_RE.
 # FAILURE-CLASS notice — a deliberate carve-out from routine-compression silence (#16775 class): the context
 # is over the compression threshold but compression is blocked (summary-LLM cooldown / anti-thrash breaker),
-# so the session will keep growing until the hard provider token limit kills it. Do NOT add it to
-# ROUTINE_COMPRESSION_STATUS_SAMPLES or the gateway noise regex (_TELEGRAM_NOISY_STATUS_RE); it is pinned
-# un-swallowed in tests/gateway/test_telegram_noise_filter.py::VISIBLE_COMPRESSION_MESSAGES.
+# so the session will keep growing until the hard provider token limit kills it. DMs keep it (the owner can act);
+# shared chats drop it in gateway/run_status_filter.py (#101003). Never add it to the noise regex
+# (_TELEGRAM_NOISY_STATUS_RE) or ROUTINE_COMPRESSION_STATUS_SAMPLES; tests/gateway/test_run_status_filter.py pins it.
 CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE = (
     "⚠ Context is over the compression threshold (~{tokens:,} tokens >= {threshold:,}) "
     "but compression is currently blocked ({reason}). The model may stop responding. Run /new to start a fresh "
@@ -146,23 +167,16 @@ ROUTINE_COMPRESSION_STATUS_SAMPLES = (
 )
 
 
-def is_compaction_progress_status(text: str | None) -> bool:
-    """True for in-progress auto-compaction lifecycle lines (not the done edge).
-    The gateway re-tags matches as ``kind="compacting"`` for the whole pause; matching only the marker left
-    idle/preflight/retry lines looking hung. ``COMPACTION_DONE_STATUS`` is emitted as ``kind="compacted"`` and
-    must not match here."""
-    body = text.strip() if isinstance(text, str) else ""
-    if not body:
-        return False
-    if COMPACTION_STATUS_MARKER in body:
-        return True
-    if body == COMPACTION_DONE_STATUS:
-        return False
-    lowered = body.lower()
-    # The failure-class overflow warning mentions compression but is a blocked notice, not progress.
-    if "compaction complete" in lowered or "compression is currently blocked" in lowered:
-        return False
-    return "compact" in lowered or "compress" in lowered or "context reduced to" in lowered
+def is_compaction_progress_status(text: object) -> bool:
+    """True for a status its producer marked as compaction in progress; gateways re-tag it ``kind="compacting"``.
+    Decided by the mark, never the wording: warnings and failure notices mention compression too."""
+    return isinstance(text, CompactionProgressText) and bool(text.strip())
+
+
+def compaction_status_kind(kind: str, text: object) -> str:
+    """The ``status.update`` kind a viewer gets: a marked lifecycle line is ``compacting`` (#97239).
+    Pass the producer's object; ``str()``/``strip()`` copies have lost the mark."""
+    return "compacting" if kind == "lifecycle" and is_compaction_progress_status(text) else str(kind)
 
 
 def _refresh_agent_tool_definitions(agent) -> bool:
@@ -1376,6 +1390,7 @@ def run_compress_context_with_progress_timeout(
 
 
 from agent.conversation_compression_checkpoint import _checkpoint_blocked, _checkpoint_incapable
+from agent.conversation_compression_feasibility import lazy_compression_feasibility_check
 
 
 def _lock_api_is_absent_on_session_db(lock_db: Any) -> bool:
@@ -1792,7 +1807,7 @@ class _CompressionActivityHeartbeat:
         near the context ceiling (#98371).
 
         Routed through ``agent._emit_status`` like every other compaction
-        status: same "lifecycle" key (the TUI gateway re-tags it to
+        status: same "lifecycle" key (gateways re-tag the marked text to
         ``compacting``; Telegram edits one bubble per key), same chat-platform
         filter, same CLI print path.
         """
@@ -1803,6 +1818,7 @@ class _CompressionActivityHeartbeat:
             return
         try:
             emit(COMPACTION_HEARTBEAT_STATUS)
+            _emit_compaction(self._agent, "still", COMPACTION_HEARTBEAT_STATUS)
         except Exception:
             logger.debug(
                 "status emit error in compression heartbeat", exc_info=True
@@ -1901,7 +1917,7 @@ def _emit_feasibility_notice(agent: Any, msg: str) -> None:
         return
     agent._last_feasibility_notice = msg
     agent._compression_warning = msg
-    agent._emit_diagnostic_status(msg)
+    agent._emit_warning(msg)
 
 
 def _lower_threshold_to_aux_context(
@@ -1991,6 +2007,36 @@ def _aux_inherits_main_route(agent: Any, aux_model: str, aux_base_url: str) -> b
     return not main_base or normalize_route_base_url(aux_base_url) == main_base
 
 
+def _configured_compression_context_length(agent: Any) -> Optional[int]:
+    """``auxiliary.compression.context_length`` as configured now (a session's side tasks follow its
+    profile, so the value captured at agent start can belong to an earlier summariser)."""
+    try:
+        from agent.auxiliary_task_config import _get_auxiliary_task_config
+        raw = _get_auxiliary_task_config("compression").get("context_length")
+    except Exception:
+        logger.debug("Compression context_length unreadable; using the value from agent start", exc_info=True)
+        return getattr(agent, "_aux_compression_context_length_config", None)
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _configured_custom_providers(agent: Any) -> Optional[list]:
+    """The provider entries as configured now, for measuring the compression model (a side task reads
+    them from config.yaml); the list captured at agent start inside a bypass session (its side tasks
+    never read the profile) or when config cannot be read."""
+    from agent.auxiliary_task_config import _SESSION_AUXILIARY
+    if _SESSION_AUXILIARY.get() is not None:
+        return getattr(agent, "_custom_providers", None)
+    try:
+        from hermes_cli.config import get_compatible_custom_providers, load_config_readonly
+        return get_compatible_custom_providers(load_config_readonly())
+    except Exception:
+        logger.debug("Provider entries unreadable; using the ones from agent start", exc_info=True)
+        return getattr(agent, "_custom_providers", None)
+
+
 def check_compression_model_feasibility(agent: Any) -> None:
     """Warn at session start if the aux compression context is below the threshold.
     Called from ``AIAgent.__init__`` (CLI sees it via ``_vprint``); the gateway wires ``status_callback``
@@ -2043,7 +2089,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
         _aux_provider = (
             _aux_cfg_provider if _aux_cfg_provider and _aux_cfg_provider != "auto" else getattr(agent, "provider", "")
         )
-        _aux_cfg_ctx = getattr(agent, "_aux_compression_context_length_config", None)
+        _aux_cfg_ctx = _configured_compression_context_length(agent)
         if _aux_cfg_ctx is None and _aux_inherits_main_route(agent, aux_model, aux_base_url):
             # Same model on the same route: reuse the main model's already-resolved window (which honours
             # model.context_length / provider pins). Re-resolving from scratch lost the pin and auto-lowered
@@ -2052,7 +2098,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
         else:
             aux_context = get_model_context_length(
                 aux_model, base_url=aux_base_url, api_key=aux_api_key, config_context_length=_aux_cfg_ctx,
-                provider=_aux_provider, custom_providers=agent._custom_providers,
+                provider=_aux_provider, custom_providers=_configured_custom_providers(agent),
             )
         # Aux model must meet MINIMUM_CONTEXT_LENGTH like the main model, else it cannot summarise a full window.
         if aux_context and aux_context < MINIMUM_CONTEXT_LENGTH:
@@ -2081,41 +2127,6 @@ def check_compression_model_feasibility(agent: Any) -> None:
         raise
     except Exception as exc:
         logger.debug("Compression feasibility check failed (non-fatal): %s", exc)
-
-
-def revalidate_compression_feasibility(agent: Any) -> None:
-    """Re-run the aux feasibility probe after the main runtime changed (model switch, fallback activation,
-    primary restore). ``update_model()`` already voided the previous ceiling; probing now clamps the trigger
-    before the first compaction on the new window rather than after it (#114707). A probe failure leaves the
-    latch unset so the lazy probe at the next compaction re-raises hard rejections."""
-    agent._compression_feasibility_checked = False
-    if not getattr(agent, "context_compressor", None):
-        return
-    try:
-        check_compression_model_feasibility(agent)
-    except Exception as exc:
-        logger.debug("Compression feasibility re-check deferred to the next compaction: %s", exc)
-        return
-    agent._compression_feasibility_checked = True
-
-
-def ensure_compression_feasibility_checked(agent: Any, estimated_tokens: int) -> None:
-    """Run the deferred aux feasibility probe once a request first reaches ``MINIMUM_CONTEXT_LENGTH`` — the
-    smallest window any summariser may have — so an aux clamp lands before the first compaction fires on the
-    main-window threshold instead of after it (#114707). Below that size no summariser can be too small, so
-    short sessions keep the probe-free cold start (#28957). A probe failure leaves the latch unset for the
-    lazy probe in ``compress_context`` to re-raise hard rejections."""
-    if getattr(agent, "_compression_feasibility_checked", False) or not getattr(agent, "context_compressor", None):
-        return
-    from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
-    if int(estimated_tokens or 0) < MINIMUM_CONTEXT_LENGTH:
-        return
-    try:
-        check_compression_model_feasibility(agent)
-    except Exception as exc:
-        logger.debug("Compression feasibility probe deferred to the first compaction: %s", exc)
-        return
-    agent._compression_feasibility_checked = True
 
 
 def replay_compression_warning(agent: Any) -> None:
@@ -2149,40 +2160,13 @@ def conversation_history_after_compression(
     return None
 
 
-_SYNTHETIC_USER_PREFIXES = (
-    "[System: Your previous response was truncated", "[System: The previous response was cut off",
-    "[System: Your previous tool call", "[Your active task list was preserved across context compression]",
-    "[IMPORTANT: Background process ",
-)
-
-
-def _message_text(message: Any) -> str:
-    content = message.get("content") if isinstance(message, dict) else None
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "\n".join(
-            str(part.get("text") or part.get("content") or "") for part in content if isinstance(part, dict)
-        )
-    return ""
-
-
-_SYNTHETIC_USER_FLAGS = (
-    "_todo_snapshot_synthetic", "_empty_recovery_synthetic", "_verification_stop_synthetic", "_pre_verify_synthetic",
-    "_dropped_toolcall_nudge",
-)
-
-
 def _is_real_user_message(message: Any) -> bool:
     """Distinguish human intent from user-role runtime scaffolding.
     A compaction summary flipped to ``role="user"`` for alternation is scaffolding and must not short-circuit
     anchor restoration."""
     if not isinstance(message, dict) or message.get("role") != "user":
         return False
-    if any(message.get(flag) for flag in _SYNTHETIC_USER_FLAGS):
-        return False
-    text = _message_text(message).strip()
-    if not text or text.startswith(_SYNTHETIC_USER_PREFIXES):
+    if is_user_role_scaffolding(message) or not _message_text(message).strip():
         return False
     from agent.context_compressor import ContextCompressor
     return not ContextCompressor._is_synthetic_compression_user_turn(message)
@@ -2538,7 +2522,12 @@ class _CompactionLifecycle:
         # cancelled fence) opt in via force_terminal so clients can retire their phase.
         # Failure warnings go through _emit_warning and are never suppressed here.
         if self.status_emitted and (self.commit_status == "committed" or force_terminal):
-            _emit_compaction_done(self._agent)
+            if self.commit_status == "committed":
+                _emit_compaction_done(self._agent)
+            else:
+                # Retiring a phase nobody finished: the surface holding its input has to be let go,
+                # and silence is what would keep it holding.
+                _emit_compaction(self._agent, "aborted", "")
 
 
 class _CompressionLease:
@@ -3179,10 +3168,7 @@ def _salvage_or_refuse_grown_transcript(
         with contextlib.suppress(Exception):
             agent.context_compressor._last_compress_refused_would_grow = True
         with contextlib.suppress(Exception):
-            agent._emit_warning(
-                "⚠️ Compression refused: the generated summary would have GROWN the conversation instead of "
-                "shrinking it. No messages were dropped — conversation continues unchanged."
-            )
+            agent._emit_warning(COMPRESSION_REFUSED_WOULD_GROW_WARNING)
         _existing_sp = _existing_system_prompt(agent, system_message)
         _emit_aborted_attempt_telemetry(agent, attempt.started_at, "would_grow", attempt.seed)
         # Count the refusal as an ineffective-compaction strike so the anti-thrash
@@ -3405,8 +3391,7 @@ def _finish_compaction_boundary(
                 agent.session_id or "", parent_session_id=_boundary_parent, reset=False, reason="compression"
             )
 
-    # Route via _emit_status so the warning reaches gateway platforms; store it on
-    # _compression_warning so a late-bound status_callback can replay it.
+    # A warning, not progress: store it on _compression_warning so a late-bound status_callback can replay it.
     compressor = agent.context_compressor
     _cc = compressor.compression_count
     if _cc >= 2:
@@ -3414,7 +3399,7 @@ def _finish_compaction_boundary(
             f"{agent.log_prefix}⚠️  Session compressed {_cc} times — accuracy may degrade. Consider /new to start fresh."
         )
         agent._compression_warning = _cc_msg
-        agent._emit_diagnostic_status(_cc_msg)
+        agent._emit_warning(_cc_msg)
 
     # session:compress lets hooks ingest the old session before it's lost;
     # in_place=True tells them the same id was compacted rather than rotated.
@@ -3983,6 +3968,7 @@ def _announce_compression_start(
         )
     if status:
         agent._emit_status(status)
+        _emit_compaction(agent, "started", status)
     return _CompactionLifecycle(agent, bool(status))
 
 
@@ -4068,13 +4054,11 @@ def compress_context(
     # _compression_warning so status replay still surfaces the warning. Marked checked
     # only after the probe completes (transient failures are swallowed inside). A hard
     # rejection propagates; retire the announced phase first so the client is not left compacting.
-    if not getattr(agent, "_compression_feasibility_checked", False):
-        try:
-            check_compression_model_feasibility(agent)
-        except Exception:
-            lifecycle.complete(force_terminal=True)
-            raise
-        agent._compression_feasibility_checked = True
+    try:
+        lazy_compression_feasibility_check(agent)
+    except Exception:
+        lifecycle.complete(force_terminal=True)
+        raise
     lease, _abort_prompt = _acquire_compression_lease(
         agent, commit_fence=commit_fence, lifecycle=lifecycle, system_message=system_message,
         approx_tokens=approx_tokens, attempt=attempt,
@@ -4435,10 +4419,9 @@ __all__ = [
     "COMPACTION_STATUS",
     "COMPACTION_STATUS_MARKER",
     "check_compression_model_feasibility",
+    "compaction_status_kind",
     "compress_context",
-    "ensure_compression_feasibility_checked",
     "is_compaction_progress_status",
     "replay_compression_warning",
-    "revalidate_compression_feasibility",
     "try_shrink_image_parts_in_messages",
 ]

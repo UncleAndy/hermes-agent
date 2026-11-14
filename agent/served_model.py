@@ -64,9 +64,14 @@ def install_served_model_capture(agent: Any, client: Any) -> None:
                     state = parse_credits_headers(headers, provider=str(getattr(agent, "provider", "") or ""))
                     if state is not None:
                         agent._credits_state = state
+                        agent._credits_provider = str(getattr(agent, "provider", "") or "").strip().lower()
                         from agent.credits_tracker import remember_response_credits
 
-                        remember_response_credits(state)
+                        # The provider is kept beside the accounting: the numbers are the money of
+                        # whoever answered, and a turn on another provider must not wear them.
+                        remember_response_credits(
+                            state, provider=str(getattr(agent, "provider", "") or "")
+                        )
                     if not _credits_capture_reported:
                         _credits_capture_reported = True
                         if state is not None:

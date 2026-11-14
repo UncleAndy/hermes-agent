@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import tempfile
 from contextvars import ContextVar, Token
@@ -42,12 +43,15 @@ _EDIT_APPROVAL_REQUESTER: ContextVar[EditApprovalRequester | None] = ContextVar(
 _PERMISSION_REQUEST_IDS = count(1)
 
 SENSITIVE_AUTO_APPROVE_NAMES = {".env", ".env.local", ".env.production", "id_rsa", "id_ed25519"}
+# Where the homes to look for are: a module constant so a check can point it at a scratch tree.
+HOMES_ROOT = Path("/home")
 AUTO_APPROVE_ASK = "ask"
 AUTO_APPROVE_WORKSPACE = "workspace_session"
 AUTO_APPROVE_SESSION = "session"
 
-_V4A_FILE_RE = re.compile(r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', re.MULTILINE)
-_V4A_MOVE_RE = re.compile(r'^\*\*\*\s+Move\s+File:\s*(.+?)\s*->\s*(.+)$', re.MULTILINE)
+# ``\s*`` after the stars as in tools/patch_parser.py: a header the parser applies must not escape approval.
+_V4A_FILE_RE = re.compile(r'^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$', re.MULTILINE)
+_V4A_MOVE_RE = re.compile(r'^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$', re.MULTILINE)
 
 
 def set_edit_approval_requester(requester: EditApprovalRequester | None) -> Token:
@@ -141,9 +145,64 @@ def build_edit_proposal(tool_name: str, arguments: dict[str, Any]) -> EditPropos
     return builder(arguments) if builder else None
 
 
+def _path_is_sensitive(candidate: Path) -> bool:
+    lowered = {part.lower() for part in candidate.parts}
+    return bool(lowered & {".git", ".ssh"}) or candidate.name.lower() in SENSITIVE_AUTO_APPROVE_NAMES
+
+
 def _is_sensitive_auto_approve_path(path: str) -> bool:
-    lowered = {part.lower() for part in Path(path).expanduser().parts}
-    return bool(lowered & {".git", ".ssh"}) or Path(path).name.lower() in SENSITIVE_AUTO_APPROVE_NAMES
+    """Whether *path* as written OR its symlink-resolved target is sensitive.
+
+    The literal name alone lets ``notes.txt -> ~/.ssh/authorized_keys`` (or a
+    symlinked parent dir) through; the target alone loses a literal ``.git``
+    component whose link points at an innocuously named directory. Unresolvable
+    paths fail closed: they ask."""
+    expanded = Path(path).expanduser()
+    if _path_is_sensitive(expanded):
+        return True
+    try:
+        return _path_is_sensitive(expanded.resolve(strict=False))
+    except (OSError, RuntimeError):
+        return True
+
+
+def _literal_paths(proposal: EditProposal) -> tuple[str, ...]:
+    """Target paths exactly as the model wrote them.
+
+    ``path`` is always included and V4A targets only in patch mode: keying on a
+    present ``patch`` string would let a stray one shadow the real ``path``."""
+    args = proposal.arguments
+    literal = [str(args["path"])] if args.get("path") else []
+    if proposal.tool_name == "patch" and args.get("mode") == "patch" and isinstance(args.get("patch"), str):
+        literal.extend(_extract_v4a_patch_paths(args["patch"]))
+    return tuple(literal)
+
+
+def _own_roots() -> tuple[Path, ...]:
+    """The places an agent may call its own: its home and the state it keeps there.
+
+    A session opened on a project asks about every edit outside that project, and an agent's own home
+    is not "outside the project" in the sense the prompt means — it is where the skills, the memory
+    and the scratch it works in live, and whoever gave it that home has already agreed to what it
+    keeps there. Sensitive paths are refused before this check, so keys and secrets still ask.
+
+    The process rarely has the home a person means: the container runs as root (so ``Path.home()`` is
+    ``/root``) while the agent lives in ``/home/hermes``, mounted from the host. A home that keeps a
+    ``.hermes`` of its own is therefore an agent home too — the operator's home keeps none, so a
+    project of theirs is not swept in by this rule.
+    """
+    roots = [Path.home()]
+    state = os.environ.get("HERMES_HOME", "").strip()
+    if state:
+        roots.append(Path(state))
+    if HOMES_ROOT.is_dir():
+        try:
+            for candidate in HOMES_ROOT.iterdir():
+                if (candidate / ".hermes").is_dir():
+                    roots.append(candidate)
+        except OSError:
+            logger.debug("Could not list the homes under %s", HOMES_ROOT, exc_info=True)
+    return tuple(root.expanduser().resolve(strict=False) for root in roots)
 
 
 def should_auto_approve_edit(proposal: EditProposal, policy: str, cwd: str | None = None) -> bool:
@@ -156,6 +215,11 @@ def should_auto_approve_edit(proposal: EditProposal, policy: str, cwd: str | Non
     paths = proposal.paths or (proposal.path,)
     if policy == AUTO_APPROVE_ASK or any(_is_sensitive_auto_approve_path(p) for p in paths):
         return False
+    # Builders canonicalize the target (symlinks followed), so a literal ``.git``
+    # link to an innocuously named directory survives only in the raw arguments.
+    # Lexical only: a relative literal has no trustworthy base here.
+    if any(_path_is_sensitive(Path(p).expanduser()) for p in _literal_paths(proposal)):
+        return False
     resolved = [Path(p).expanduser().resolve(strict=False) for p in paths]
     if policy == AUTO_APPROVE_SESSION:
         return True
@@ -164,8 +228,11 @@ def should_auto_approve_edit(proposal: EditProposal, policy: str, cwd: str | Non
         # (``/private/tmp`` on macOS since resolve() follows the symlink).
         tmp = Path(tempfile.gettempdir()).resolve(strict=False)
         ws = Path(cwd).expanduser().resolve(strict=False) if cwd else None
+        own = _own_roots()
         return all(
-            path.is_relative_to(tmp) or (ws is not None and path.is_relative_to(ws))
+            path.is_relative_to(tmp)
+            or (ws is not None and path.is_relative_to(ws))
+            or any(path.is_relative_to(root) for root in own)
             for path in resolved)
     return False
 
